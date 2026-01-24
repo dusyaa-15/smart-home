@@ -1,0 +1,8 @@
+path: dataset_fire_smoke
+train: train/images
+val: valid/images
+test: test/images
+
+names:
+  0: fire
+  1: smoke

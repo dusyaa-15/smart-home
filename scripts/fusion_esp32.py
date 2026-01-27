@@ -8,7 +8,7 @@ from datetime import datetime
 
 def main():
     # ESP32 camera stream URL (default ESP32-CAM IP)
-    ESP32_IP = "192.168.1.100"  # Change to your ESP32 IP
+    ESP32_IP = "10.153.251.20"  # Change to your ESP32 IP
     ESP32_PORT = 81
     STREAM_URL = f"http://{ESP32_IP}:{ESP32_PORT}/stream"
     

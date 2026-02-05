@@ -1,6 +1,7 @@
 import cv2
 import time
 import os
+import random
 from ultralytics import YOLO
 from pathlib import Path
 
@@ -23,12 +24,26 @@ def main():
 
     print("⏳ Loading models on CPU...")
 
-    coco_model = YOLO("yolov8n.pt")      # ALL COCO CLASSES
+    coco_model = YOLO("yolov8n.pt")
     fire_model = YOLO(str(fire_model_path))
 
-    # ---- FORCE CPU ----
     coco_model.to("cpu")
     fire_model.to("cpu")
+
+    CLASS_NAMES = coco_model.names
+
+    # =========================
+    # GENERATE COLORS PER CLASS
+    # =========================
+    random.seed(123)
+    CLASS_COLORS = {
+        cls_id: (
+            random.randint(60, 255),
+            random.randint(60, 255),
+            random.randint(60, 255)
+        )
+        for cls_id in CLASS_NAMES
+    }
 
     print("✅ Models loaded")
 
@@ -74,7 +89,6 @@ def main():
 
         yolo_frame = cv2.resize(frame, (YOLO_SIZE, YOLO_SIZE))
 
-        # ---- INFERENCE ON CPU ----
         r_coco = coco_model.predict(
             yolo_frame,
             conf=COCO_CONF,
@@ -103,32 +117,36 @@ def main():
         sx = w / YOLO_SIZE
         sy = h / YOLO_SIZE
 
-        # ---- DRAW COCO OBJECTS (GREEN) ----
-        if coco_present and r_coco.boxes and len(r_coco.boxes) > 0:
+        # =========================
+        # DRAW COCO OBJECTS (PER-CLASS COLOR)
+        # =========================
+        if coco_present and r_coco.boxes:
             for box in r_coco.boxes:
                 conf = float(box.conf[0])
-                cls  = int(box.cls[0])
+                cls_id = int(box.cls[0])
 
-                label = coco_model.names.get(cls, "obj")
+                label = CLASS_NAMES.get(cls_id, "obj")
+                color = CLASS_COLORS.get(cls_id, (0, 255, 0))
 
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-
                 x1, x2 = int(x1*sx), int(x2*sx)
                 y1, y2 = int(y1*sy), int(y2*sy)
 
-                cv2.rectangle(output, (x1,y1), (x2,y2), (0,255,0), 2)
+                cv2.rectangle(output, (x1,y1), (x2,y2), color, 2)
                 cv2.putText(
                     output,
                     f"{label} {conf:.2f}",
-                    (x1, y1-6),
+                    (x1, max(20, y1-6)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
-                    (0,255,0),
+                    color,
                     2
                 )
 
-        # ---- DRAW FIRE ONLY (RED) ----
-        if fire_present and r_fire.boxes and len(r_fire.boxes) > 0:
+        # =========================
+        # DRAW FIRE (ALWAYS RED)
+        # =========================
+        if fire_present and r_fire.boxes:
             for box in r_fire.boxes:
                 conf = float(box.conf[0])
 
@@ -139,8 +157,8 @@ def main():
                 cv2.rectangle(output, (x1,y1), (x2,y2), (0,0,255), 2)
                 cv2.putText(
                     output,
-                    f"Fire {conf:.2f}",
-                    (x1, y1-6),
+                    f"FIRE {conf:.2f}",
+                    (x1, max(20, y1-6)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
                     (0,0,255),
@@ -148,12 +166,17 @@ def main():
                 )
 
         fps = 1.0 / (time.time() - loop_start + 1e-6)
-        cv2.putText(output, f"FPS: {fps:.1f}",
-                    (20,40),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1, (0,255,255), 2)
+        cv2.putText(
+            output,
+            f"FPS: {fps:.1f}",
+            (20,40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (0,255,255),
+            2
+        )
 
-        cv2.imshow("ESP32 – Fire + COCO Detection", output)
+        cv2.imshow("ESP32 – Fire + COCO Detection (CPU)", output)
 
         if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q")):
             break

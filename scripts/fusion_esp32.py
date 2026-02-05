@@ -2,183 +2,196 @@ import cv2
 import time
 import os
 import torch
+import random
 from ultralytics import YOLO
-from pathlib import Path
+from threading import Thread, Lock
 
-# ============================
-# ESP32 STREAM CONFIG
-# ============================
+# =========================
+# CONFIG
+# =========================
 ESP32_STREAM_URL = "http://192.168.4.1:81/stream"
-YOLO_SIZE = 416
 
-# ============================
-# DETECTION PARAMETERS
-# ============================
-PERSIST_TIME = 0.7
+YOLO_SIZE = 320
+DETECT_EVERY_N_FRAMES = 3
 COCO_CONF = 0.35
-FIRE_CONF = 0.45
-# ============================
+
+BOX_THICKNESS = 2
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+FONT_SCALE = 0.6
+TEXT_THICKNESS = 2
 
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "timeout;60000"
 
+# =========================
+# CAMERA THREAD (LATEST FRAME ONLY)
+# =========================
+class Camera:
+    def __init__(self, url):
+        self.cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.frame = None
+        self.lock = Lock()
+        self.running = True
+        Thread(target=self._reader, daemon=True).start()
 
+    def _reader(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if ret:
+                with self.lock:
+                    self.frame = frame
+
+    def read(self):
+        with self.lock:
+            return None if self.frame is None else self.frame.copy()
+
+    def stop(self):
+        self.running = False
+        self.cap.release()
+
+# =========================
+# MAIN
+# =========================
 def main():
-    root = Path(__file__).resolve().parents[1]
-    fire_model_path = root / "models" / "fire_smoke_best.pt"
 
-    if not fire_model_path.exists():
-        print("❌ Fire model not found:", fire_model_path)
-        return
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA not available")
 
-    # =====================================
-    # CHECK GPU
-    # =====================================
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    DEVICE = "cuda"
     print(f"🔥 Using device: {DEVICE}")
 
-    print("⏳ Loading models...")
+    # =========================
+    # LOAD MODELS
+    # =========================
+    print("⏳ Loading YOLOv8 COCO model...")
 
-    coco_model = YOLO("yolov8n.pt")
-    fire_model = YOLO(str(fire_model_path))
+    model_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "yolov8n.pt"
+    )
 
-    # ---- MOVE TO GPU ----
+    coco_model = YOLO(model_path)
     coco_model.to(DEVICE)
-    fire_model.to(DEVICE)
 
-    print("✅ Models loaded on", DEVICE)
+    CLASS_NAMES = coco_model.names
 
-    # ============================
-    # Open ESP32 MJPEG stream
-    # ============================
-    cap = cv2.VideoCapture(ESP32_STREAM_URL, cv2.CAP_FFMPEG)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    # =========================
+    # GENERATE COLORS (ONE PER CLASS)
+    # =========================
+    random.seed(42)
+    CLASS_COLORS = {
+        cls_id: (
+            random.randint(50, 255),
+            random.randint(50, 255),
+            random.randint(50, 255),
+        )
+        for cls_id in CLASS_NAMES
+    }
 
-    if not cap.isOpened():
-        print("❌ Cannot open ESP32 stream")
-        return
+    print("✅ Model loaded")
 
-    print("✅ ESP32 stream connected")
+    # =========================
+    # CAMERA
+    # =========================
+    cam = Camera(ESP32_STREAM_URL)
+    time.sleep(2)
 
-    last_coco_seen = 0.0
-    last_fire_seen = 0.0
-    last_frame_time = time.time()
+    # =========================
+    # GPU WARM-UP
+    # =========================
+    dummy = torch.zeros((1, 3, YOLO_SIZE, YOLO_SIZE), device="cuda")
+    coco_model.predict(dummy, verbose=False)
 
+    frame_count = 0
+    last_boxes = None
+
+    # =========================
+    # LOOP
+    # =========================
     while True:
-        loop_start = time.time()
+        start = time.time()
 
-        # Drop old frames
-        for _ in range(3):
-            cap.grab()
-
-        ret, frame = cap.retrieve()
-
-        if not ret or frame is None:
-            if time.time() - last_frame_time > 5:
-                print("⚠️ Stream stalled, reconnecting...")
-                cap.release()
-                time.sleep(1)
-                cap = cv2.VideoCapture(ESP32_STREAM_URL, cv2.CAP_FFMPEG)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                last_frame_time = time.time()
+        frame = cam.read()
+        if frame is None:
             continue
 
-        last_frame_time = time.time()
-
         h, w = frame.shape[:2]
+        frame_count += 1
+
+        # =========================
+        # YOLO INFERENCE
+        # =========================
+        if frame_count % DETECT_EVERY_N_FRAMES == 0:
+            yolo_frame = cv2.resize(frame, (YOLO_SIZE, YOLO_SIZE))
+            results = coco_model.predict(
+                yolo_frame,
+                imgsz=YOLO_SIZE,
+                conf=COCO_CONF,
+                device=DEVICE,
+                verbose=False
+            )[0]
+            last_boxes = results.boxes
+
+        # =========================
+        # DRAW RESULTS
+        # =========================
         output = frame.copy()
-
-        # Resize for YOLO
-        yolo_frame = cv2.resize(frame, (YOLO_SIZE, YOLO_SIZE))
-
-        # =========================
-        # GPU INFERENCE
-        # =========================
-        r_coco = coco_model.predict(
-            yolo_frame,
-            conf=COCO_CONF,
-            verbose=False,
-            device=DEVICE
-        )[0]
-
-        r_fire = fire_model.predict(
-            yolo_frame,
-            conf=FIRE_CONF,
-            verbose=False,
-            device=DEVICE
-        )[0]
-
-        now = time.time()
-
-        if r_coco.boxes is not None and len(r_coco.boxes) > 0:
-            last_coco_seen = now
-
-        if r_fire.boxes is not None and len(r_fire.boxes) > 0:
-            last_fire_seen = now
-
-        coco_present = (now - last_coco_seen) < PERSIST_TIME
-        fire_present = (now - last_fire_seen) < PERSIST_TIME
-
         sx = w / YOLO_SIZE
         sy = h / YOLO_SIZE
 
-        # =========================
-        # DRAW COCO OBJECTS - GREEN
-        # =========================
-        if coco_present and r_coco.boxes is not None:
-            for box in r_coco.boxes:
-                conf = float(box.conf[0])
-                cls = int(box.cls[0])
-
-                label = coco_model.names.get(cls, "obj")
-
+        if last_boxes is not None and len(last_boxes) > 0:
+            for box in last_boxes:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                x1, x2 = int(x1 * sx), int(x2 * sx)
-                y1, y2 = int(y1 * sy), int(y2 * sy)
+                conf = float(box.conf[0])
+                cls_id = int(box.cls[0])
+                label = CLASS_NAMES[cls_id]
+                color = CLASS_COLORS[cls_id]
 
-                cv2.rectangle(output, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(
-                    output, f"{label} {conf:.2f}",
-                    (x1, y1 - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55, (0, 255, 0), 2
+                x1 = int(x1 * sx)
+                x2 = int(x2 * sx)
+                y1 = int(y1 * sy)
+                y2 = int(y2 * sy)
+
+                cv2.rectangle(
+                    output,
+                    (x1, y1),
+                    (x2, y2),
+                    color,
+                    BOX_THICKNESS
                 )
 
-        # =========================
-        # DRAW FIRE - RED
-        # =========================
-        if fire_present and r_fire.boxes is not None:
-            for box in r_fire.boxes:
-                conf = float(box.conf[0])
-
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                x1, x2 = int(x1 * sx), int(x2 * sx)
-                y1, y2 = int(y1 * sy), int(y2 * sy)
-
-                cv2.rectangle(output, (x1, y1), (x2, y2), (0, 0, 255), 2)
                 cv2.putText(
-                    output, f"FIRE {conf:.2f}",
-                    (x1, y1 - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7, (0, 0, 255), 2
+                    output,
+                    f"{label} {conf:.2f}",
+                    (x1, max(20, y1 - 6)),
+                    FONT,
+                    FONT_SCALE,
+                    color,
+                    TEXT_THICKNESS,
+                    cv2.LINE_AA
                 )
 
         # =========================
         # FPS
         # =========================
-        fps = 1.0 / (time.time() - loop_start + 1e-6)
+        fps = 1.0 / (time.time() - start + 1e-6)
         cv2.putText(
-            output, f"FPS: {fps:.1f}",
+            output,
+            f"FPS: {fps:.1f}",
             (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1, (255, 255, 0), 2
+            FONT,
+            1,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA
         )
 
-        cv2.imshow("ESP32 – Fire + COCO Detection [GPU]", output)
+        cv2.imshow("ESP32 – YOLOv8 COCO (ALL CLASSES)", output)
 
-        if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q")):
+        if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
-    cap.release()
+    cam.stop()
     cv2.destroyAllWindows()
 
 

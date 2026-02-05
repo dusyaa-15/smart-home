@@ -1,6 +1,7 @@
 import cv2
 import time
 import os
+import torch
 from ultralytics import YOLO
 from pathlib import Path
 
@@ -18,7 +19,6 @@ COCO_CONF = 0.35
 FIRE_CONF = 0.45
 # ============================
 
-# Increase FFmpeg tolerance for ESP32 MJPEG
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "timeout;60000"
 
 
@@ -30,10 +30,22 @@ def main():
         print("❌ Fire model not found:", fire_model_path)
         return
 
+    # =====================================
+    # CHECK GPU
+    # =====================================
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"🔥 Using device: {DEVICE}")
+
     print("⏳ Loading models...")
-    coco_model = YOLO("yolov8n.pt")       # All COCO classes
+
+    coco_model = YOLO("yolov8n.pt")
     fire_model = YOLO(str(fire_model_path))
-    print("✅ Models loaded")
+
+    # ---- MOVE TO GPU ----
+    coco_model.to(DEVICE)
+    fire_model.to(DEVICE)
+
+    print("✅ Models loaded on", DEVICE)
 
     # ============================
     # Open ESP32 MJPEG stream
@@ -79,18 +91,20 @@ def main():
         yolo_frame = cv2.resize(frame, (YOLO_SIZE, YOLO_SIZE))
 
         # =========================
-        # INFERENCE
+        # GPU INFERENCE
         # =========================
         r_coco = coco_model.predict(
             yolo_frame,
             conf=COCO_CONF,
-            verbose=False
+            verbose=False,
+            device=DEVICE
         )[0]
 
         r_fire = fire_model.predict(
             yolo_frame,
             conf=FIRE_CONF,
-            verbose=False
+            verbose=False,
+            device=DEVICE
         )[0]
 
         now = time.time()
@@ -159,7 +173,7 @@ def main():
             1, (255, 255, 0), 2
         )
 
-        cv2.imshow("ESP32 – Fire + COCO Detection", output)
+        cv2.imshow("ESP32 – Fire + COCO Detection [GPU]", output)
 
         if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q")):
             break

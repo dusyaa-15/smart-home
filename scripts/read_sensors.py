@@ -13,6 +13,7 @@ SAVE_INTERVAL = 1   # seconds (1 or 2)
 CSV_FILE = "sensor_dataset.csv"
 # ==========================
 
+
 # ---- Open serial ----
 print("Connecting to Arduino...")
 ser = serial.Serial(PORT, BAUD, timeout=1)
